@@ -54,11 +54,8 @@ app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const pool = new Pool({
-    user: 'postgres',
-    host: 'localhost',
-    database: 'schedule_db',
-    password: '1234',
-    port: 5432,
+    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:1234@localhost:5432/schedule_db',
+    ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
 pool.connect()
