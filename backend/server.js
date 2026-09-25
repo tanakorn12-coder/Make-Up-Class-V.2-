@@ -53,14 +53,32 @@ app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
+
+
+const { Pool } = require('pg');
+
 const pool = new Pool({
-    user: 'postgres',
-    host: 'localhost',
-    database: 'schedule_db',
-    password: '1234',
-    port: 5432,
+  // ดึงค่า URL ของ Neon มาจาก Render
+  connectionString: process.env.DATABASE_URL, 
+  
+  // บังคับให้ใช้ SSL (สำคัญมาก ถ้าไม่ใส่บรรทัดนี้คลาวด์จะปฏิเสธการเชื่อมต่อ)
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 
+module.exports = pool; // (หรือตามที่คุณเขียน export ไว้)
+
+//ล่างนี้เก็บไว้
+// const pool = new Pool({
+//     user: 'postgres',
+//     host: 'localhost',
+//     database: 'schedule_db',
+//     password: '1234',
+//     port: 5432,
+// });
+
+//ล่างนี้เก็บไว้
 // const pool = new Pool({
 //     connectionString: process.env.DATABASE_URL || 'postgresql://postgres:1234@localhost:5432/schedule_db',
 //     ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
