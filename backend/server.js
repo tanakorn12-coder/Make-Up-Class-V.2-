@@ -55,7 +55,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 
 
-const { Pool } = require('pg');
+
 
 const pool = new Pool({
   // ดึงค่า URL ของ Neon มาจาก Render
