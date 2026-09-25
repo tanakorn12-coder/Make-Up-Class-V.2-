@@ -1,4 +1,4 @@
-export const API = 'https://api.render.com/deploy/srv-dar0ssm0tbcc738ji590?key=OPjMrounJIQ'
+export const API = import.meta.env.VITE_API_URL;
 
 export const STATUS_MAP = {
   'รอตรวจสอบ':          { bg: '#FFF8E1', text: '#795548', dot: '#F9A825' },
