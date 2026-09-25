@@ -1,4 +1,4 @@
-export const API = 'http://localhost:3001/api'
+export const API = 'https://api.render.com/deploy/srv-dar0ssm0tbcc738ji590?key=OPjMrounJIQ'
 
 export const STATUS_MAP = {
   'รอตรวจสอบ':          { bg: '#FFF8E1', text: '#795548', dot: '#F9A825' },
