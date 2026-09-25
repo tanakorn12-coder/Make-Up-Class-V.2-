@@ -3,13 +3,55 @@ const { Pool } = require('pg');
 const cors = require('cors');
 const multer = require('multer');
 const xlsx = require('xlsx');
+const fs = require('fs');
 
-// ตั้งค่าที่เก็บไฟล์ชั่วคราว
-const upload = multer({ dest: 'uploads/' });
+const path = require('path');
+
+let pdfParse;
+try {
+    pdfParse = require('pdf-parse');
+} catch (e) {
+    console.error('❌ ยังไม่ได้ติดตั้ง pdf-parse! โปรดรัน npm install pdf-parse');
+}
+
+// Excel ใช้ temp ก่อน แล้ว route จะย้ายไฟล์ต้นฉบับไปโฟลเดอร์ตามปี/ภาคเรียน
+const upload = multer({ dest: 'uploads/.tmp/' });
+const documentUpload = multer({
+    dest: 'uploads/documents/',
+    limits: { fileSize: 10 * 1024 * 1024 },
+    fileFilter: (req, file, callback) => {
+        const allowed = ['application/pdf', 'image/png', 'image/jpeg', 'image/jpg'];
+        callback(null, allowed.includes(file.mimetype));
+    },
+});
+
+// ==========================================
+// 🌟 1. ตัวแปรสำหรับรับไฟล์ PDF (ปรับ Path ให้ปลอดภัย 100%)
+// ==========================================
+const verifiedPdfUpload = multer({
+    dest: path.join(__dirname, 'uploads', 'verified_schedules'),
+    limits: { fileSize: 10 * 1024 * 1024 },
+    fileFilter: (req, file, callback) => {
+        if (file.mimetype === 'application/pdf') {
+            callback(null, true);
+        } else {
+            callback(new Error('รองรับเฉพาะไฟล์ PDF เท่านั้น'), false);
+        }
+    },
+    
+});
+
+
+
 const app = express();
+
+fs.mkdirSync(path.join(__dirname, 'uploads', 'documents'), { recursive: true });
+fs.mkdirSync(path.join(__dirname, 'uploads', '.tmp'), { recursive: true });
+fs.mkdirSync(path.join(__dirname, 'uploads', 'verified_schedules'), { recursive: true }); // 🌟 โฟลเดอร์เก็บ PDF ยืนยันตาราง
 
 app.use(cors());
 app.use(express.json());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 const pool = new Pool({
     user: 'postgres',
@@ -20,37 +62,51 @@ const pool = new Pool({
 });
 
 pool.connect()
-    .then(() => console.log('✅ เชื่อมต่อฐานข้อมูล PostgreSQL สำเร็จ!'))
+    .then(async () => {
+        // อัปเดตตารางเดิม
+        await pool.query(`ALTER TABLE main_classes ADD COLUMN IF NOT EXISTS academic_year VARCHAR(10), ADD COLUMN IF NOT EXISTS semester VARCHAR(10)`);
+        await pool.query(`ALTER TABLE schedules ADD COLUMN IF NOT EXISTS academic_year VARCHAR(10), ADD COLUMN IF NOT EXISTS semester VARCHAR(10)`);
+        await pool.query(`ALTER TABLE schedules ADD COLUMN IF NOT EXISTS document_path TEXT, ADD COLUMN IF NOT EXISTS document_name TEXT`);
+        
+        // 🌟 เพิ่มคอลัมน์สำหรับระบบ Lock ตารางสอน
+        await pool.query(`ALTER TABLE main_classes ADD COLUMN IF NOT EXISTS is_locked BOOLEAN DEFAULT false, ADD COLUMN IF NOT EXISTS verified_pdf_path TEXT`);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS academic_uploads (
+                id SERIAL PRIMARY KEY,
+                academic_year VARCHAR(10) NOT NULL,
+                semester VARCHAR(10) NOT NULL,
+                branch TEXT,
+                curriculum TEXT,
+                schedule_type VARCHAR(20) NOT NULL DEFAULT 'student',
+                year_level TEXT,
+                original_name TEXT NOT NULL,
+                stored_name TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`ALTER TABLE academic_uploads ADD COLUMN IF NOT EXISTS branch TEXT`);
+        await pool.query(`ALTER TABLE academic_uploads ADD COLUMN IF NOT EXISTS curriculum TEXT, ADD COLUMN IF NOT EXISTS schedule_type VARCHAR(20) NOT NULL DEFAULT 'student', ADD COLUMN IF NOT EXISTS year_level TEXT`);
+        console.log('✅ เชื่อมต่อฐานข้อมูล PostgreSQL สำเร็จ!');
+    })
     .catch(err => console.error('❌ เกิดข้อผิดพลาด', err.stack));
+
 // ==========================================
 // Helper Function: คัดกรองและรวมกลุ่มเรียนที่ซ้ำซ้อน
 // ==========================================
 const mergeAndCleanGroups = (groupsArray) => {
-    // 1. ถ้าไม่มีข้อมูล ให้ส่งค่าว่างกลับไป
     if (!groupsArray || groupsArray.length === 0) return '';
-    
-    // 2. กรองเอาเฉพาะข้อมูลที่มีค่าจริงๆ (ลบค่า null/undefined ทิ้ง)
     let validGroups = groupsArray.filter(Boolean);
-    
-    // 3. เรียงลำดับจากข้อความที่ "ยาวที่สุด" ไปหา "สั้นที่สุด"
     validGroups.sort((a, b) => b.length - a.length);
-    
     const keptGroups = [];
-    
     validGroups.forEach(g => {
-        // ลบช่องว่างออกเพื่อการเปรียบเทียบที่แม่นยำ
         const cleanG = g.replace(/\s+/g, ''); 
-        
-        // 4. ตรวจสอบว่า ชื่อกลุ่มนี้ ถูกครอบคลุมอยู่ในชื่อกลุ่มยาวๆ ที่เราเก็บไว้แล้วหรือยัง?
         const isDuplicate = keptGroups.some(kept => kept.replace(/\s+/g, '').includes(cleanG));
-        
-        // 5. ถ้ายังไม่มี (ไม่ซ้ำ) ให้เก็บเข้ากล่อง
         if (!isDuplicate) {
             keptGroups.push(g);
         }
     });
-    
-    // 6. เรียงลำดับตัวอักษรให้สวยงาม แล้วจับมัดรวมกันด้วย ' | '
     return keptGroups.sort().join(' | ');
 };
 
@@ -77,7 +133,6 @@ app.post('/api/import-excel', upload.single('file'), async (req, res) => {
             
             if (!subjectCode || !teacherName) continue;
 
-            // 🌟 แก้ไข: อัปเดตข้อมูลตาราง main_classes ผ่านการเชื่อม class_student_groups
             const updateQuery = `
                 UPDATE main_classes 
                 SET teacher_name = $1 
@@ -110,9 +165,58 @@ app.post('/api/import-excel', upload.single('file'), async (req, res) => {
     }
 });
 
+// ==========================================
+// 🌟 API: อัปโหลด PDF เพื่อล็อคตารางสอน (คืนค่าการทำงานแบบอิสระ)
+// ==========================================
+app.post('/api/upload-verified-pdf', verifiedPdfUpload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ success: false, message: 'กรุณาอัปโหลดไฟล์ PDF' });
+
+        const teacher_name = req.body.teacher_name;
+        const academic_year = req.body.academic_year;
+        const semester = req.body.semester;
+
+        if (!teacher_name || !academic_year || !semester) {
+            if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); 
+            return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
+        }
+
+        // จัดการเปลี่ยนชื่อและบันทึกไฟล์
+        const safeTeacherName = teacher_name.replace(/[^\wก-๙]/g, '_');
+        const fileName = `VERIFIED_${academic_year}_${semester}_${safeTeacherName}_${Date.now()}.pdf`;
+        const targetPath = path.join(req.file.destination, fileName);
+        
+        fs.renameSync(req.file.path, targetPath);
+        const relativePath = `/uploads/verified_schedules/${fileName}`;
+
+        // ล็อคตารางในฐานข้อมูล
+        const updateQuery = `
+            UPDATE main_classes 
+            SET is_locked = true, verified_pdf_path = $1 
+            WHERE REPLACE(teacher_name, ' ', '') ILIKE $2
+            AND academic_year = $3 AND semester = $4
+        `;
+        
+        const cleanName = teacher_name.replace(/\s+/g, '');
+        const result = await pool.query(updateQuery, [relativePath, `%${cleanName}%`, academic_year, semester]);
+
+        if (result.rowCount === 0) {
+            return res.json({ success: false, message: `ไม่พบตารางสอนของ ${teacher_name} ในปีการศึกษา ${academic_year}/${semester} (ระบบจึงไม่ได้ล็อคข้อมูล)` });
+        }
+
+        res.json({ success: true, message: `ล็อคตารางสอนจำนวน ${result.rowCount} รายการ สำเร็จแล้ว!`, pdf_path: relativePath });
+
+    } catch (error) {
+        console.error('Verified PDF Upload Error:', error);
+        if (req.file && req.file.path && fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+        }
+        res.status(500).json({ success: false, message: `ระบบขัดข้อง: ${error.message}` });
+    }
+});
+
 /**
  * API สำหรับดึงข้อมูลชื่ออาจารย์แบบอัตโนมัติ
- * รองรับการค้นหาแบบยืดหยุ่น (ILIKE) และกรองข้อมูลที่ไม่สมบูรณ์ออก
  */
 app.get('/api/get-subject-info', async (req, res) => {
     const { subject_code, student_group } = req.query;
@@ -122,7 +226,6 @@ app.get('/api/get-subject-info', async (req, res) => {
     }
 
     try {
-        // 🌟 แก้ไข: ค้นหาจาก 2 ตารางใหม่
         const query = `
             SELECT m.teacher_name 
             FROM main_classes m
@@ -135,23 +238,13 @@ app.get('/api/get-subject-info', async (req, res) => {
             LIMIT 1
         `;
         
-        const values = [
-            subject_code.trim(), 
-            `%${student_group.trim()}%`
-        ];
-
+        const values = [subject_code.trim(), `%${student_group.trim()}%`];
         const result = await pool.query(query, values);
 
         if (result.rows.length > 0) {
-            res.json({ 
-                success: true, 
-                teacher_name: result.rows[0].teacher_name 
-            });
+            res.json({ success: true, teacher_name: result.rows[0].teacher_name });
         } else {
-            res.json({ 
-                success: false, 
-                message: 'ไม่พบชื่ออาจารย์ในระบบ (กรุณาอัปโหลดตารางสอน)' 
-            });
+            res.json({ success: false, message: 'ไม่พบชื่ออาจารย์ในระบบ (กรุณาอัปโหลดตารางสอน)' });
         }
     } catch (error) {
         console.error('Database Error:', error);
@@ -160,200 +253,228 @@ app.get('/api/get-subject-info', async (req, res) => {
 });
 
 // ==========================================
-// API: ตรวจสอบการชนกันของตาราง (อัปเกรดแก้ Error + ค้นหา)
+// API: ตรวจสอบการชนกันของตาราง
 // ==========================================
 app.post('/api/check-schedule', async (req, res) => {
-    const { teacher_name, student_group, year_level, class_date, start_time, end_time } = req.body;
+    // 🌟 ดึง academic_year และ semester มาใช้งานด้วย
+    const { teacher_name, student_group, year_level, class_date, start_time, end_time, room_id, academic_year, semester } = req.body;
 
     try {
         const daysMap = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
         const dayOfWeek = daysMap[new Date(class_date).getDay()];
 
-        let cleanTeacher = teacher_name ? teacher_name.replace(/อาจารย์|อ\.|ผศ\.|รศ\.|ศ\.|ดร\./g, '').trim().split(' ')[0] : '';
-        if (!cleanTeacher) cleanTeacher = 'NOT_FOUND';
+        let cleanTeacherName = teacher_name ? teacher_name.replace(/อาจารย์|อ\.|ผศ\.|รศ\.|ศ\.|ดร\./g, '').trim().replace(/\s+/g, '') : '';
+        let cleanRoom = room_id ? room_id.trim() : '';
 
-        const cleanYearMatch = year_level ? year_level.match(/ปี\s*\d/) : null;
-        let cleanYear = cleanYearMatch ? cleanYearMatch[0] : '';
-        if (!cleanYear) cleanYear = 'NOT_FOUND';
+        let checkGroupString = '';
+        let displayGroupName = student_group || '';
+        if (student_group) {
+            let g = student_group.replace(/\s*\([ทป.,\s]+\)$/, '').trim(); 
+            if (g.includes('-')) {
+                checkGroupString = g.substring(g.indexOf('-') + 1).trim().replace(/\s+/g, '');
+                displayGroupName = g.substring(g.indexOf('-') + 1).trim();
+            } else {
+                checkGroupString = g.replace(/\s+/g, '');
+                displayGroupName = g;
+            }
+        }
 
-        const safeGroup = student_group ? student_group.trim() : 'NOT_FOUND';
-
-        // --- ส่วนที่ 1: ตรวจสอบตารางเรียนปกติ ---
-        // 🌟 แก้ไข: ใช้ 2 ตารางเชื่อมกัน
         const regQuery = `
-            SELECT m.* FROM main_classes m
+            SELECT m.teacher_name, m.room_id, m.subject_code, m.subject_name, m.start_time::text, m.end_time::text, csg.student_group 
+            FROM main_classes m
             LEFT JOIN class_student_groups csg ON m.id = csg.class_id
+            LEFT JOIN student_groups_master g ON csg.student_group = g.short_name
             WHERE m.day_of_week = $1 
+            AND m.start_time < $3::time AND m.end_time > $2::time
+            AND m.academic_year = $7 AND m.semester = $8
             AND (
-                m.teacher_name ILIKE $2 
-                OR csg.student_group ILIKE $3 
-                OR csg.student_group ILIKE $4
+                ($4 != '' AND REPLACE(m.teacher_name, ' ', '') ILIKE '%' || $4 || '%') OR
+                ($5 != '' AND $5 != '-' AND TRIM(m.room_id) ILIKE $5) OR
+                ($6 != '' AND (
+                    REPLACE(csg.student_group, ' ', '') ILIKE '%' || $6 || '%' OR
+                    REPLACE(g.full_name, ' ', '') ILIKE '%' || $6 || '%'
+                ))
             )
-            AND m.start_time < $6 AND m.end_time > $5
             LIMIT 1
         `;
-        const regValues = [
-            dayOfWeek, 
-            `%${cleanTeacher}%`, 
-            `%${cleanYear}%`,
-            `%${safeGroup}%`, 
-            start_time, 
-            end_time
-        ];
-        const regResult = await pool.query(regQuery, regValues);
+        // 🌟 ส่งค่าปีและเทอมเข้าไปเช็คด้วย
+        const regResult = await pool.query(regQuery, [dayOfWeek, start_time, end_time, cleanTeacherName, cleanRoom, checkGroupString, academic_year, semester]);
 
         if (regResult.rows.length > 0) {
             const conflict = regResult.rows[0];
-            const isTeacherConflict = conflict.teacher_name && conflict.teacher_name.includes(cleanTeacher);
-            const who = isTeacherConflict ? `อาจารย์ผู้สอน` : `นักศึกษาชั้น ${year_level}`;
+            const dbTeacher = conflict.teacher_name ? conflict.teacher_name.replace(/\s+/g, '') : '';
+            const dbRoom = conflict.room_id ? conflict.room_id.trim() : '';
+            const dbGroup = conflict.student_group ? conflict.student_group.replace(/\s+/g, '') : '';
+            const subName = conflict.subject_name ? conflict.subject_name.split('-')[0].trim() : '';
+
+            let reasons = [];
+            if (checkGroupString && dbGroup.includes(checkGroupString)) reasons.push(`นักศึกษากลุ่ม "${displayGroupName}" ติดเรียน`);
+            if (cleanTeacherName && dbTeacher.includes(cleanTeacherName)) reasons.push(`อาจารย์ผู้สอนติดสอน`);
+            if (cleanRoom && dbRoom.toLowerCase() === cleanRoom.toLowerCase() && reasons.length === 0) reasons.push(`ห้อง ${conflict.room_id} ไม่ว่าง`);
             
-            return res.json({
-                isConflict: true,
-                message: `❌ ไม่สามารถลงได้: ${who} ติดเรียน/สอนวิชา ${conflict.subject_code} เวลา ${conflict.start_time.slice(0,5)} - ${conflict.end_time.slice(0,5)}`
-            });
+            let reasonStr = reasons.length > 0 ? reasons.join(' และ ') : 'เวลาชน';
+            return res.json({ isConflict: true, message: `❌ ไม่สามารถลงได้: ${reasonStr} (ตารางปกติ วิชา ${conflict.subject_code} ${subName} เวลา ${conflict.start_time.slice(0,5)} - ${conflict.end_time.slice(0,5)} น.)` });
         }
 
-        // --- ส่วนที่ 2: ตรวจสอบตารางสอนชดเชยที่ถูกอนุมัติไปแล้ว ---
         const mkQuery = `
-            SELECT * FROM schedules 
-            WHERE class_date = $1 
-            AND status = 'อนุมัติแล้ว'
+            SELECT teacher_name, room_id, subject_code, subject_name, start_time::text, end_time::text, student_group 
+            FROM schedules
+            WHERE class_date = $1
+            AND start_time < $3::time AND end_time > $2::time
+            AND status IN ('รอตรวจสอบ', 'อนุมัติแล้ว', 'รอผู้บริหารพิจารณา')
+            AND academic_year = $7 AND semester = $8
             AND (
-                teacher_name ILIKE $2 
-                OR student_group ILIKE $3 
-                OR year_level ILIKE $4
+                ($4 != '' AND REPLACE(teacher_name, ' ', '') ILIKE '%' || $4 || '%') OR
+                ($5 != '' AND $5 != '-' AND TRIM(room_id) ILIKE $5) OR
+                ($6 != '' AND REPLACE(student_group, ' ', '') ILIKE '%' || $6 || '%')
             )
-            AND start_time < $6 AND end_time > $5
             LIMIT 1
         `;
-        const mkValues = [
-            class_date, 
-            `%${cleanTeacher}%`, 
-            `%${safeGroup}%`, 
-            `%${cleanYear}%`, 
-            start_time, 
-            end_time
-        ];
-        const mkResult = await pool.query(mkQuery, mkValues);
+        // 🌟 ส่งค่าปีและเทอมเข้าไปเช็คด้วย
+        const mkResult = await pool.query(mkQuery, [class_date, start_time, end_time, cleanTeacherName, cleanRoom, checkGroupString, academic_year, semester]);
 
         if (mkResult.rows.length > 0) {
             const conflict = mkResult.rows[0];
-            const isTeacherConflict = conflict.teacher_name && conflict.teacher_name.includes(cleanTeacher);
-            const who = isTeacherConflict ? `อาจารย์ผู้สอน` : `นักศึกษาชั้น ${year_level}`;
+            const dbTeacher = conflict.teacher_name ? conflict.teacher_name.replace(/\s+/g, '') : '';
+            const dbRoom = conflict.room_id ? conflict.room_id.trim() : '';
+            const dbGroup = conflict.student_group ? conflict.student_group.replace(/\s+/g, '') : '';
+            const subName = conflict.subject_name ? conflict.subject_name.split('-')[0].trim() : '';
+
+            let reasons = [];
+            if (checkGroupString && dbGroup.includes(checkGroupString)) reasons.push(`นักศึกษากลุ่ม "${displayGroupName}" ติดเรียน`);
+            if (cleanTeacherName && dbTeacher.includes(cleanTeacherName)) reasons.push(`อาจารย์ผู้สอนติดสอน`);
+            if (cleanRoom && dbRoom.toLowerCase() === cleanRoom.toLowerCase() && reasons.length === 0) reasons.push(`ห้อง ${conflict.room_id} ไม่ว่าง`);
             
-            return res.json({
-                isConflict: true,
-                message: `ไม่สามารถลงได้: ${who} ติดสอน/เรียนชดเชยวิชา ${conflict.subject_code} เวลา ${conflict.start_time.slice(0,5)} - ${conflict.end_time.slice(0,5)}`
-            });
+            let reasonStr = reasons.length > 0 ? reasons.join(' และ ') : 'เวลาชน';
+            return res.json({ isConflict: true, message: `❌ ไม่สามารถลงได้: ${reasonStr} (สอนชดเชย วิชา ${conflict.subject_code} ${subName} เวลา ${conflict.start_time.slice(0,5)} - ${conflict.end_time.slice(0,5)} น.)` });
         }
 
-        res.json({ 
-            isConflict: false, 
-            message: 'เวลาว่างตรงกันทั้งอาจารย์และนักศึกษา สามารถบันทึกคำขอได้ครับ!' 
-        });
+        res.json({ isConflict: false, message: 'เวลาว่างตรงกันทั้งอาจารย์และนักศึกษา สามารถบันทึกคำขอได้ครับ!' });
 
     } catch (error) {
         console.error('Check Schedule Error:', error);
-        res.status(500).json({ isConflict: true, message: 'เกิดข้อผิดพลาดในระบบตรวจสอบตาราง โปรดดู Console แจ้งเตือนหลังบ้าน' });
+        res.status(500).json({ isConflict: true, message: 'เกิดข้อผิดพลาดในระบบตรวจสอบตาราง โปรดดู Console' });
     }
 });
 
+
 // ==========================================
-// API: บันทึกคำขอสอนชดเชย (อัปเกรดระบบตรวจจับการชน 100% ครอบคลุมทุกสาขา)
+// API: บันทึกคำขอสอนชดเชย
 // ==========================================
 app.post('/api/schedules', async (req, res) => {
-    const { teacher_name, subject_code, year_level, student_group, room_id, class_date, start_time, end_time, missed_date, reason, subject_name } = req.body;
+    const { teacher_name, subject_code, year_level, student_group, room_id, class_date, start_time, end_time, missed_date, reason, subject_name, academic_year, semester } = req.body;
 
     try {
-        // 🛑 ด่าน 1: เช็คระบบเปิด/ปิด
         const settingQuery = await pool.query("SELECT setting_value FROM system_settings WHERE setting_key = 'allow_booking'");
-        const isBookingAllowed = settingQuery.rows.length > 0 && settingQuery.rows[0].setting_value === 'true';
+        const isBookingAllowed = settingQuery.rows.length === 0 || settingQuery.rows[0].setting_value === 'true';
 
         if (!isBookingAllowed) {
             return res.status(403).json({ success: false, message: 'ระบบปิดรับคำขอสอนชดเชยชั่วคราว' });
         }
 
-        // 🌟 1. แปลงวันที่แบบรัดกุม (ป้องกันปัญหา พ.ศ./ค.ศ. และ Timezone)
         const [y, m, d] = class_date.split('-');
         const realYear = parseInt(y) > 2500 ? parseInt(y) - 543 : parseInt(y); 
         const safeDate = new Date(realYear, parseInt(m) - 1, parseInt(d));
         const dayIndex = safeDate.getDay(); 
 
-        // 🌟 2. เตรียมชื่อวัน "ทุกรูปแบบ" (ครอบคลุมคำย่อที่แต่ละสาขาอาจจะพิมพ์ไม่เหมือนกัน)
-        const dayFormats = [
-            ['วันอาทิตย์', 'อาทิตย์', 'อา.', 'Sunday', '7', 'Sun'],
-            ['วันจันทร์', 'จันทร์', 'จ.', 'Monday', '1', 'Mon'],
-            ['วันอังคาร', 'อังคาร', 'อ.', 'Tuesday', '2', 'Tue'],
-            ['วันพุธ', 'พุธ', 'พ.', 'Wednesday', '3', 'Wed'],
-            ['วันพฤหัสบดี', 'พฤหัสบดี', 'พฤหัส', 'พฤ.', 'Thursday', '4', 'Thu'],
-            ['วันศุกร์', 'ศุกร์', 'ศ.', 'Friday', '5', 'Fri'],
-            ['วันเสาร์', 'เสาร์', 'ส.', 'Saturday', '6', 'Sat']
-        ];
+        const dayFormats = [['วันอาทิตย์','7'], ['วันจันทร์','1'], ['วันอังคาร','2'], ['วันพุธ','3'], ['วันพฤหัสบดี','4'], ['วันศุกร์','5'], ['วันเสาร์','6']];
         const possibleDays = dayFormats[dayIndex]; 
 
-        // 🌟 3. ทำความสะอาดข้อความ ป้องกันปัญหาช่องว่างซ่อนเร้น
         const cleanTeacherName = teacher_name ? teacher_name.replace(/\s+/g, '') : '';
         const cleanRoom = room_id ? room_id.trim() : '';
-        const cleanGroup = student_group ? student_group.replace(/\s+/g, '') : '';
 
-        // 🛑 ด่าน 2: เช็คตารางเรียนปกติ (ถอด REPLACE ออกจากเวลา เพราะ DB เป็น Type Time อยู่แล้ว)
+        let checkGroupString = '';
+        let displayGroupName = student_group || '';
+        if (student_group) {
+            let g = student_group.replace(/\s*\([ทป.,\s]+\)$/, '').trim(); 
+            if (g.includes('-')) {
+                checkGroupString = g.substring(g.indexOf('-') + 1).trim().replace(/\s+/g, '');
+                displayGroupName = g.substring(g.indexOf('-') + 1).trim();
+            } else {
+                checkGroupString = g.replace(/\s+/g, '');
+                displayGroupName = g;
+            }
+        }
+
         const checkMainQuery = `
-            SELECT m.id 
+            SELECT m.id, m.teacher_name, m.room_id, m.subject_code, m.subject_name, m.start_time::text, m.end_time::text, csg.student_group
             FROM main_classes m
             LEFT JOIN class_student_groups csg ON m.id = csg.class_id
             LEFT JOIN student_groups_master g ON csg.student_group = g.short_name
             WHERE TRIM(m.day_of_week) = ANY($1::text[])
             AND m.start_time < $3::time 
             AND m.end_time > $2::time
+            AND m.academic_year = $7 AND m.semester = $8
             AND (
                 ($4 != '' AND REPLACE(m.teacher_name, ' ', '') ILIKE '%' || $4 || '%') OR
                 ($5 != '' AND $5 != '-' AND TRIM(m.room_id) ILIKE $5) OR
                 ($6 != '' AND (
                     REPLACE(csg.student_group, ' ', '') ILIKE '%' || $6 || '%' OR
-                    $6 ILIKE '%' || REPLACE(csg.student_group, ' ', '') || '%' OR
-                    REPLACE(g.full_name, ' ', '') ILIKE '%' || $6 || '%' OR
-                    $6 ILIKE '%' || REPLACE(g.full_name, ' ', '') || '%'
+                    REPLACE(g.full_name, ' ', '') ILIKE '%' || $6 || '%'
                 ))
             )
             LIMIT 1
         `;
-        const mainConflict = await pool.query(checkMainQuery, [possibleDays, start_time, end_time, cleanTeacherName, cleanRoom, cleanGroup]);
+        // 🌟 ส่งค่าปีและเทอมเข้าไปเช็คด้วย
+        const mainConflict = await pool.query(checkMainQuery, [possibleDays, start_time, end_time, cleanTeacherName, cleanRoom, checkGroupString, academic_year, semester]);
 
         if (mainConflict.rows.length > 0) {
-            return res.status(400).json({ success: false, message: '❌ ไม่สามารถจองได้: เวลาที่เลือกชนกับ "ตารางเรียนปกติ" (อาจารย์ ห้อง หรือนักศึกษาไม่ว่าง)' });
+            const conflict = mainConflict.rows[0];
+            const dbTeacher = conflict.teacher_name ? conflict.teacher_name.replace(/\s+/g, '') : '';
+            const dbRoom = conflict.room_id ? conflict.room_id.trim() : '';
+            const dbGroup = conflict.student_group ? conflict.student_group.replace(/\s+/g, '') : '';
+            const subName = conflict.subject_name ? conflict.subject_name.split('-')[0].trim() : '';
+
+            let reasons = [];
+            if (checkGroupString && dbGroup.includes(checkGroupString)) reasons.push(`นักศึกษากลุ่ม "${displayGroupName}" ติดเรียน`);
+            if (cleanTeacherName && dbTeacher.includes(cleanTeacherName)) reasons.push(`อาจารย์ผู้สอนติดสอน`);
+            if (cleanRoom && dbRoom.toLowerCase() === cleanRoom.toLowerCase() && reasons.length === 0) reasons.push(`ห้อง ${conflict.room_id} ไม่ว่าง`);
+            
+            let reasonStr = reasons.length > 0 ? reasons.join(' และ ') : 'เวลาชน';
+            return res.status(400).json({ success: false, message: `❌ ไม่สามารถจองได้: ${reasonStr} (ตารางปกติ วิชา ${conflict.subject_code} ${subName} เวลา ${conflict.start_time.slice(0,5)} - ${conflict.end_time.slice(0,5)} น.)` });
         }
 
-        // 🛑 ด่าน 3: เช็คชนกับคำขอสอนชดเชยของคนอื่น
         const checkMakeupQuery = `
-            SELECT id FROM schedules
+            SELECT id, teacher_name, room_id, subject_code, subject_name, start_time::text, end_time::text, student_group
+            FROM schedules
             WHERE class_date = $1
             AND start_time < $3::time 
             AND end_time > $2::time
             AND status IN ('รอตรวจสอบ', 'อนุมัติแล้ว', 'รอผู้บริหารพิจารณา')
+            AND academic_year = $7 AND semester = $8
             AND (
                 ($4 != '' AND REPLACE(teacher_name, ' ', '') ILIKE '%' || $4 || '%') OR
                 ($5 != '' AND $5 != '-' AND TRIM(room_id) ILIKE $5) OR
-                ($6 != '' AND (
-                    REPLACE(student_group, ' ', '') ILIKE '%' || $6 || '%' OR
-                    $6 ILIKE '%' || REPLACE(student_group, ' ', '') || '%'
-                ))
+                ($6 != '' AND REPLACE(student_group, ' ', '') ILIKE '%' || $6 || '%')
             )
             LIMIT 1
         `;
-        const makeupConflict = await pool.query(checkMakeupQuery, [class_date, start_time, end_time, cleanTeacherName, cleanRoom, cleanGroup]);
+        // 🌟 ส่งค่าปีและเทอมเข้าไปเช็คด้วย
+        const makeupConflict = await pool.query(checkMakeupQuery, [class_date, start_time, end_time, cleanTeacherName, cleanRoom, checkGroupString, academic_year, semester]);
 
         if (makeupConflict.rows.length > 0) {
-             return res.status(400).json({ success: false, message: '❌ ไม่สามารถจองได้: เวลาที่เลือกชนกับการจองชดเชยท่านอื่น (อาจารย์ ห้อง หรือนักศึกษาไม่ว่าง)' });
+            const conflict = makeupConflict.rows[0];
+            const dbTeacher = conflict.teacher_name ? conflict.teacher_name.replace(/\s+/g, '') : '';
+            const dbRoom = conflict.room_id ? conflict.room_id.trim() : '';
+            const dbGroup = conflict.student_group ? conflict.student_group.replace(/\s+/g, '') : '';
+            const subName = conflict.subject_name ? conflict.subject_name.split('-')[0].trim() : '';
+
+            let reasons = [];
+            if (checkGroupString && dbGroup.includes(checkGroupString)) reasons.push(`นักศึกษากลุ่ม "${displayGroupName}" ติดเรียน`);
+            if (cleanTeacherName && dbTeacher.includes(cleanTeacherName)) reasons.push(`อาจารย์ผู้สอนติดสอน`);
+            if (cleanRoom && dbRoom.toLowerCase() === cleanRoom.toLowerCase() && reasons.length === 0) reasons.push(`ห้อง ${conflict.room_id} ไม่ว่าง`);
+            
+            let reasonStr = reasons.length > 0 ? reasons.join(' และ ') : 'เวลาชน';
+            return res.status(400).json({ success: false, message: `❌ ไม่สามารถจองได้: ${reasonStr} (สอนชดเชย วิชา ${conflict.subject_code} ${subName} เวลา ${conflict.start_time.slice(0,5)} - ${conflict.end_time.slice(0,5)} น.)` });
         }
 
-        // ✅ ด่าน 4: ผ่านทุกเงื่อนไข บันทึกได้เลย
         const insertQuery = `
             INSERT INTO schedules
-            (teacher_name, subject_code, subject_name, year_level, student_group, room_id, class_date, start_time, end_time, status, missed_date, reason)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'รอตรวจสอบ', $10, $11)
+            (teacher_name, subject_code, subject_name, year_level, student_group, room_id, class_date, start_time, end_time, status, missed_date, reason, academic_year, semester)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'รอตรวจสอบ', $10, $11, $12, $13)
             RETURNING id
         `;
-        const values = [teacher_name, subject_code, subject_name, year_level, student_group, room_id, class_date, start_time, end_time, missed_date, reason];
+        const values = [teacher_name, subject_code, subject_name, year_level, student_group, room_id, class_date, start_time, end_time, missed_date, reason, academic_year, semester];
         const result = await pool.query(insertQuery, values);
 
         res.json({ success: true, message: '✅ บันทึกคำขอสอนชดเชยสำเร็จ', id: result.rows[0].id });
@@ -364,34 +485,66 @@ app.post('/api/schedules', async (req, res) => {
     }
 });
 
-
-
+// ==========================================
+// 3. API: แก้ไขคำขอสอนชดเชย
+// ==========================================
 app.put('/api/schedules/:id', async (req, res) => {
+    // 🌟 ดึง academic_year และ semester มาใช้งานด้วย
     const { id } = req.params;
-    // 🌟 1. ดึง missed_date และ reason มาจาก req.body เพิ่มเติม
-    const { teacher_name, subject_code, year_level, student_group, room_id, class_date, start_time, end_time, missed_date, reason } = req.body;
+    const { teacher_name, subject_code, year_level, student_group, room_id, class_date, start_time, end_time, missed_date, reason, academic_year, semester } = req.body;
 
     try {
-        const cleanTeacherName = teacher_name.replace(/\s+/g, '');
+        const cleanTeacherName = teacher_name ? teacher_name.replace(/\s+/g, '') : '';
+        const cleanRoom = room_id ? room_id.trim() : '';
+
+        let checkGroupString = '';
+        let displayGroupName = student_group || '';
+        if (student_group) {
+            let g = student_group.replace(/\s*\([ทป.,\s]+\)$/, '').trim(); 
+            if (g.includes('-')) {
+                checkGroupString = g.substring(g.indexOf('-') + 1).trim().replace(/\s+/g, '');
+                displayGroupName = g.substring(g.indexOf('-') + 1).trim();
+            } else {
+                checkGroupString = g.replace(/\s+/g, '');
+                displayGroupName = g;
+            }
+        }
 
         const checkMakeupQuery = `
-            SELECT id FROM schedules
+            SELECT id, teacher_name, room_id, subject_code, subject_name, start_time::text, end_time::text, student_group
+            FROM schedules
             WHERE class_date = $1
-            AND start_time::time < $3::time AND end_time::time > $2::time
-            AND status IN ('รอตรวจสอบ', 'อนุมัติแล้ว')
+            AND start_time < $3::time 
+            AND end_time > $2::time
+            AND status IN ('รอตรวจสอบ', 'อนุมัติแล้ว', 'รอผู้บริหารพิจารณา')
+            AND academic_year = $8 AND semester = $9
             AND (
-                REPLACE(teacher_name, ' ', '') = $4 OR room_id = $5 OR student_group = $6
+                ($4 != '' AND REPLACE(teacher_name, ' ', '') ILIKE '%' || $4 || '%') OR
+                ($5 != '' AND $5 != '-' AND TRIM(room_id) ILIKE $5) OR
+                ($6 != '' AND REPLACE(student_group, ' ', '') ILIKE '%' || $6 || '%')
             )
             AND id != $7 
             LIMIT 1
         `;
-        const makeupConflict = await pool.query(checkMakeupQuery, [class_date, start_time, end_time, cleanTeacherName, room_id, student_group, id]);
+        // 🌟 ส่งค่าปีและเทอมเข้าไปเช็คด้วย
+        const makeupConflict = await pool.query(checkMakeupQuery, [class_date, start_time, end_time, cleanTeacherName, cleanRoom, checkGroupString, id, academic_year, semester]);
 
         if (makeupConflict.rows.length > 0) {
-             return res.status(400).json({ success: false, message: 'แก้ไขไม่ได้: เวลาที่แก้ใหม่ไปชนกับการจองของท่านอื่น' });
+            const conflict = makeupConflict.rows[0];
+            const dbTeacher = conflict.teacher_name ? conflict.teacher_name.replace(/\s+/g, '') : '';
+            const dbRoom = conflict.room_id ? conflict.room_id.trim() : '';
+            const dbGroup = conflict.student_group ? conflict.student_group.replace(/\s+/g, '') : '';
+            const subName = conflict.subject_name ? conflict.subject_name.split('-')[0].trim() : '';
+
+            let reasons = [];
+            if (checkGroupString && dbGroup.includes(checkGroupString)) reasons.push(`นักศึกษากลุ่ม "${displayGroupName}" ติดเรียน`);
+            if (cleanTeacherName && dbTeacher.includes(cleanTeacherName)) reasons.push(`อาจารย์ผู้สอนติดสอน`);
+            if (cleanRoom && dbRoom.toLowerCase() === cleanRoom.toLowerCase() && reasons.length === 0) reasons.push(`ห้อง ${conflict.room_id} ไม่ว่าง`);
+            
+            let reasonStr = reasons.length > 0 ? reasons.join(' และ ') : 'เวลาชน';
+            return res.status(400).json({ success: false, message: `❌ ไม่สามารถแก้ไขได้: ${reasonStr} (สอนชดเชย วิชา ${conflict.subject_code} ${subName} เวลา ${conflict.start_time.slice(0,5)} - ${conflict.end_time.slice(0,5)} น.)` });
         }
 
-        // 🌟 2. เพิ่ม missed_date = $9 และ reason = $10 เข้าไป (ทำให้ id ต้องขยับไปเป็น $11)
         const updateQuery = `
             UPDATE schedules
             SET teacher_name = $1, subject_code = $2, year_level = $3, student_group = $4, 
@@ -400,23 +553,7 @@ app.put('/api/schedules/:id', async (req, res) => {
                 status = 'รอตรวจสอบ', remark = NULL
             WHERE id = $11
         `;
-        
-        // 🌟 3. ใส่ค่าลง Array ให้ตรงกับลำดับ $1 ถึง $11
-        const values = [
-            teacher_name, 
-            subject_code, 
-            year_level, 
-            student_group, 
-            room_id, 
-            class_date, 
-            start_time, 
-            end_time, 
-            missed_date, // จับคู่กับ $9
-            reason,      // จับคู่กับ $10
-            id           // จับคู่กับ $11
-        ];
-        
-        await pool.query(updateQuery, values);
+        await pool.query(updateQuery, [teacher_name, subject_code, year_level, student_group, room_id, class_date, start_time, end_time, missed_date, reason, id]);
 
         res.json({ success: true, message: 'บันทึกการแก้ไขสำเร็จ' });
 
@@ -426,14 +563,9 @@ app.put('/api/schedules/:id', async (req, res) => {
     }
 });
 
-// ==========================================
-// API: ดึงข้อมูลคำขอสอนชดเชย (อัปเกรดเทียบข้อมูลด้วย รหัสวิชา ป้องกันชื่ออาจารย์ไม่ตรงกัน)
-// ==========================================
 app.get('/api/schedules', async (req, res) => {
     const { teacher_name } = req.query;
-
     try {
-        // 🌟 เปลี่ยนไปดึงข้อมูล สาขา/คณะ โดยเทียบจาก subject_code แทน teacher_name
         let query = `
             SELECT 
                 s.*, 
@@ -468,31 +600,24 @@ app.get('/api/schedules', async (req, res) => {
     }
 });
 
-// ==========================================
-// API: อัปเดตสถานะคำขอ (และหมายเหตุ)
-// ==========================================
 app.put('/api/schedules/:id/status', async (req, res) => {
     const { id } = req.params;
-    const { status, remark } = req.body; // 🌟 รับ remark มาด้วย
+    const { status, remark } = req.body; 
 
     try {
-        // 🌟 อัปเดตทั้งสถานะและ remark
         const updateQuery = `
             UPDATE schedules 
             SET status = $1, remark = $2 
             WHERE id = $3
         `;
         await pool.query(updateQuery, [status, remark || null, id]);
-
         res.json({ success: true, message: 'อัปเดตสถานะสำเร็จ' });
     } catch (error) {
         console.error('Update Status Error:', error);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
     }
 });           
-// ==========================================
-// API: เข้าสู่ระบบ (อัปเกรดแนบข้อมูล ตำแหน่ง และ สาขากลับไปด้วย)
-// ==========================================
+
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
 
@@ -504,24 +629,14 @@ app.post('/api/login', async (req, res) => {
             const user = result.rows[0];
 
             if (user.is_blocked) {
-                return res.json({ 
-                    success: false, 
-                    message: '🚫 บัญชีของคุณถูกระงับการใช้งาน กรุณาติดต่อแอดมินระบบ' 
-                });
+                return res.json({ success: false, message: '🚫 บัญชีของคุณถูกระงับการใช้งาน กรุณาติดต่อแอดมินระบบ' });
             }
 
             res.json({ 
                 success: true, 
                 user: { 
-                    id: user.id, 
-                    username: user.username, 
-                    name: user.name, 
-                    role: user.role,
-                    // 🌟 เพิ่มการส่งข้อมูลเหล่านี้กลับไปให้หน้าเว็บ เผื่อต้องใช้งาน
-                    title: user.title,
-                    faculty: user.faculty,
-                    branch: user.branch,
-                    curriculum: user.curriculum
+                    id: user.id, username: user.username, name: user.name, role: user.role,
+                    title: user.title, faculty: user.faculty, branch: user.branch, curriculum: user.curriculum
                 } 
             });
         } else {
@@ -533,14 +648,21 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// ==========================================
-// API: อัปโหลดและอ่านไฟล์ Excel (แปลง นาย/นางสาว เป็น อาจารย์ อัตโนมัติ)
-// ==========================================
 app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ success: false, message: 'กรุณาอัปโหลดไฟล์ Excel' });
+        const academicYear = req.body.academic_year ? String(req.body.academic_year).trim() : null;
+        const semester = req.body.semester ? String(req.body.semester).trim() : null;
+        if (!academicYear || !semester) {
+            if (req.file.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+            return res.status(400).json({ success: false, message: 'กรุณาเลือกปีการศึกษาและภาคเรียนก่อนนำเข้าข้อมูล' });
+        }
 
-        const workbook = xlsx.readFile(req.file.path);
+        const safePart = value => String(value).trim().replace(/[^\wก-๙-]/g, '_') || 'ไม่ระบุ';
+        const utf8OriginalName = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
+        const safeOriginalName = path.basename(req.file.originalname).replace(/[^\wก-๙.() -]/g, '_');
+        const temporaryPath = req.file.path;
+        const workbook = xlsx.readFile(temporaryPath);
         const sheet = workbook.Sheets[workbook.SheetNames[0]];
         const merges = sheet['!merges'] || []; 
         const sheetRange = xlsx.utils.decode_range(sheet['!ref']); 
@@ -571,8 +693,6 @@ app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
                     if (titleMatch) {
                         let tempTitle = titleMatch[0].trim();
                         teacherName = rawTextWithoutPrefix.replace(tempTitle, '').trim();
-                        
-                        // 🌟 ดักจับ: ถ้ายศเป็น นาย/นาง/นางสาว ให้เปลี่ยนเป็น อาจารย์
                         teacherTitle = ['นาย', 'นาง', 'นางสาว'].includes(tempTitle) ? 'อาจารย์' : tempTitle;
                     } else {
                         const parts = rawTextWithoutPrefix.split(' ');
@@ -604,6 +724,24 @@ app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
         const dbBra = isTeacherFile ? branch : null;
         const dbCur = isTeacherFile ? curriculum : null;
 
+        const archiveCurriculum = curriculum || dbCur || 'ไม่ระบุหลักสูตร';
+        const scheduleType = isTeacherFile ? 'ตารางสอน' : 'ตารางเรียน';
+        const archiveYearLevel = isTeacherFile ? '' : (yearLevel || 'ไม่ระบุชั้นปี');
+        const archiveBranch = branch || dbBra || '';
+        const folderParts = ['excel', safePart(academicYear), `semester-${safePart(semester)}`, safePart(archiveCurriculum), scheduleType];
+        if (!isTeacherFile) folderParts.push(safePart(archiveYearLevel));
+        const folderRelative = path.join(...folderParts);
+        const folderAbsolute = path.join(__dirname, 'uploads', folderRelative);
+        fs.mkdirSync(folderAbsolute, { recursive: true });
+        const storedName = `${Date.now()}-${safeOriginalName || 'schedule.xlsx'}`;
+        const storedAbsolute = path.join(folderAbsolute, storedName);
+        fs.renameSync(temporaryPath, storedAbsolute);
+        const relativePath = `/uploads/${folderRelative.replace(/\\/g, '/')}/${storedName}`;
+        await pool.query(
+            `INSERT INTO academic_uploads (academic_year, semester, branch, curriculum, schedule_type, year_level, original_name, stored_name, relative_path) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+            [academicYear, semester, archiveBranch, archiveCurriculum, scheduleType, archiveYearLevel || null, utf8OriginalName, storedName, relativePath]
+        );
+
         let colCode = 15, colName = 19, colGroup = 36, colTeacher = -1; 
         for (let r = 0; r < 30; r++) {
             for (let c = 10; c < 60; c++) {
@@ -632,7 +770,14 @@ app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
                     const nameCell = sheet[xlsx.utils.encode_cell({ r: r, c: colName })] || sheet[xlsx.utils.encode_cell({ r: r, c: colName + 1 })]; 
                     if (nameCell && nameCell.v) {
                         let sName = nameCell.v.toString().trim();
-                        if (sName.includes(' - ')) sName = sName.split(' - ')[0].trim(); 
+                        
+                        // 🌟 ดึงชื่อภาษาไทยมาเก็บไว้ในฐานข้อมูล (แทนที่จะดึงภาษาอังกฤษอย่างเดียว)
+                        if (sName.includes(' - ')) {
+                            const parts = sName.split(' - ');
+                            const thaiPart = parts.find(p => /[ก-๙]/.test(p));
+                            sName = thaiPart ? thaiPart.trim() : parts[0].trim();
+                        }
+                        
                         subjectMap[code] = sName;
                     }
 
@@ -650,7 +795,6 @@ app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
                                 const tMatch = tName.match(titleMatchRegex);
                                 if (tMatch) {
                                     let tempTitle = tMatch[0].trim();
-                                    // 🌟 ดักจับ: ถ้ายศตารางล่างเป็น นาย/นาง/นางสาว ให้เปลี่ยนเป็น อาจารย์
                                     extTitle = ['นาย', 'นาง', 'นางสาว'].includes(tempTitle) ? 'อาจารย์' : tempTitle;
                                 }
                                 
@@ -775,28 +919,28 @@ app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
                                 if (endTime.length < 5) endTime = '0' + endTime;
 
                                 const details = subjectDetailsMap[subjectCode] || { sector: 'ปกติ', theory: 0, practical: 0 };
-                                const checkConsecutiveQuery = `SELECT m.id FROM main_classes m JOIN class_student_groups csg ON m.id = csg.class_id WHERE m.day_of_week = $1 AND m.end_time = $2 AND m.room_id = $3 AND m.subject_code = $4 AND csg.student_group = $5`;
-                                const consecRes = await pool.query(checkConsecutiveQuery, [simpleDay, startTime, roomId, subjectCode, studentGroup]);
+                                const checkConsecutiveQuery = `SELECT m.id FROM main_classes m JOIN class_student_groups csg ON m.id = csg.class_id WHERE m.day_of_week = $1 AND m.end_time = $2 AND m.room_id = $3 AND m.subject_code = $4 AND csg.student_group = $5 AND m.academic_year = $6 AND m.semester = $7`;
+                                const consecRes = await pool.query(checkConsecutiveQuery, [simpleDay, startTime, roomId, subjectCode, studentGroup, academicYear, semester]);
 
                                 if (consecRes.rows.length > 0) {
                                     await pool.query(`UPDATE main_classes SET end_time = $1, faculty = COALESCE($2, faculty), branch = COALESCE($3, branch), curriculum = COALESCE($4, curriculum), teacher_title = COALESCE($5, teacher_title) WHERE id = $6`, [endTime, dbFac, dbBra, dbCur, currentTitle, consecRes.rows[0].id]);
                                     skippedCount++; continue; 
                                 }
 
-                                const checkQuery = `SELECT m.id FROM main_classes m JOIN class_student_groups csg ON m.id = csg.class_id WHERE m.day_of_week = $1 AND m.start_time = $2 AND csg.student_group = $3`;
-                                const { rows } = await pool.query(checkQuery, [simpleDay, startTime, studentGroup]);
+                                const checkQuery = `SELECT m.id FROM main_classes m JOIN class_student_groups csg ON m.id = csg.class_id WHERE m.day_of_week = $1 AND m.start_time = $2 AND csg.student_group = $3 AND m.academic_year = $4 AND m.semester = $5`;
+                                const { rows } = await pool.query(checkQuery, [simpleDay, startTime, studentGroup, academicYear, semester]);
 
                                 if (rows.length === 0) {
-                                    const mainQuery = `SELECT id FROM main_classes WHERE day_of_week = $1 AND start_time = $2 AND room_id = $3 AND subject_code = $4`;
-                                    const mainRes = await pool.query(mainQuery, [simpleDay, startTime, roomId, subjectCode]);
+                                    const mainQuery = `SELECT id FROM main_classes WHERE day_of_week = $1 AND start_time = $2 AND room_id = $3 AND subject_code = $4 AND academic_year = $5 AND semester = $6`;
+                                    const mainRes = await pool.query(mainQuery, [simpleDay, startTime, roomId, subjectCode, academicYear, semester]);
                                     let mainClassId;
                                     if (mainRes.rows.length > 0) {
                                         mainClassId = mainRes.rows[0].id;
                                         if (currentTeacher !== 'ไม่ระบุ') await pool.query(`UPDATE main_classes SET teacher_name = $1, teacher_title = COALESCE($2, teacher_title) WHERE id = $3 AND teacher_name = 'ไม่ระบุ'`, [currentTeacher, currentTitle, mainClassId]);
                                         await pool.query(`UPDATE main_classes SET theory_hours = $1, practical_hours = $2, sector = $3, faculty = COALESCE($4, faculty), branch = COALESCE($5, branch), curriculum = COALESCE($6, curriculum) WHERE id = $7`, [details.theory, details.practical, details.sector, dbFac, dbBra, dbCur, mainClassId]);
                                     } else {
-                                        const insertMain = `INSERT INTO main_classes (subject_code, subject_name, teacher_name, teacher_title, day_of_week, start_time, end_time, room_id, theory_hours, practical_hours, sector, faculty, branch, curriculum) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id`;
-                                        const newMain = await pool.query(insertMain, [subjectCode, subjectName, currentTeacher, currentTitle, simpleDay, startTime, endTime, roomId, details.theory, details.practical, details.sector, dbFac, dbBra, dbCur]);
+                                        const insertMain = `INSERT INTO main_classes (subject_code, subject_name, teacher_name, teacher_title, day_of_week, start_time, end_time, room_id, theory_hours, practical_hours, sector, faculty, branch, curriculum, academic_year, semester) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id`;
+                                        const newMain = await pool.query(insertMain, [subjectCode, subjectName, currentTeacher, currentTitle, simpleDay, startTime, endTime, roomId, details.theory, details.practical, details.sector, dbFac, dbBra, dbCur, academicYear, semester]);
                                         mainClassId = newMain.rows[0].id;
                                     }
                                     await pool.query(`INSERT INTO class_student_groups (class_id, student_group) VALUES ($1, $2)`, [mainClassId, studentGroup]);
@@ -813,37 +957,31 @@ app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
             }
         }
         const modeText = isTeacherFile ? `${teacherTitle} ${teacherName}` : 'กลุ่มนักศึกษา';
-        res.json({ success: true, message: `อัปโหลดตารางสำเร็จ! โหมด: ${modeText} (ข้อมูลใหม่: ${insertedCount} | ผสาน/อัปเดต: ${skippedCount}) 🎊` });
-    } catch (error) { console.error('Upload Error:', error); res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการอ่านรูปแบบไฟล์ Excel' }); }
+        res.json({ success: true, file: { original_name: req.file.originalname, relative_path: relativePath, academic_year: academicYear, semester, curriculum: archiveCurriculum, schedule_type: scheduleType, year_level: archiveYearLevel }, message: `อัปโหลด${scheduleType}สำเร็จและเก็บไฟล์ไว้ในหลักสูตร ${archiveCurriculum}! (ข้อมูลใหม่: ${insertedCount} | ผสาน/อัปเดต: ${skippedCount})` });
+    } catch (error) { console.error('Upload Error:', error); if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการอ่านรูปแบบไฟล์ Excel แต่ไฟล์ต้นฉบับถูกเก็บไว้แล้ว' }); }
 });
 
-
-
-// ==========================================
-// API: ค้นหาตารางสอนของอาจารย์ 
-// ==========================================
 app.get('/api/teacher-classes', async (req, res) => {
-    const { teacherName, forBooking } = req.query;
+    const { teacherName, forBooking, academic_year, semester } = req.query;
     try {
         const cleanName = teacherName ? teacherName.replace(/\s+/g, '') : '';
 
+        // 🌟 เพิ่มการดึง is_locked และ verified_pdf_path ออกมาให้ฝั่ง Frontend รับรู้
         const regRes = await pool.query(`
             SELECT 
                 m.*, 
-                m.teacher_title AS title, -- 🌟 1. ดึงคำนำหน้ามาด้วยเพื่อเอาไปแสดงผล
-                -- 🌟 แทรก COALESCE ไว้ใน ARRAY_AGG เพื่อแปลชื่อก่อนมัดรวมกัน
+                m.teacher_title AS title, 
                 ARRAY_AGG(COALESCE(g.full_name, csg.student_group)) as groups
             FROM main_classes m
             LEFT JOIN class_student_groups csg ON m.id = csg.class_id
-            -- 🌟 JOIN ตาราง Master ของเราเข้าไปเทียบรหัส
             LEFT JOIN student_groups_master g ON csg.student_group = g.short_name
             WHERE REPLACE(m.teacher_name, ' ', '') ILIKE $1
+            AND ($2 = '' OR m.academic_year = $2)
+            AND ($3 = '' OR m.semester = $3)
             GROUP BY m.id
-        `, [`%${cleanName}%`]);
+        `, [`%${cleanName}%`, academic_year || '', semester || '']);
         
-        // 🌟 แปลงร่างเป็น student_group กลับคืนมา
         const regularClasses = regRes.rows.map(row => {
-            // 🌟 2. ดักจับ Sec ควบ (แตกข้อความที่มี | ออกเป็นชิ้นๆ ก่อนส่งให้ mergeAndCleanGroups)
             let expandedGroups = [];
             if (row.groups) {
                 row.groups.forEach(g => {
@@ -852,7 +990,6 @@ app.get('/api/teacher-classes', async (req, res) => {
                     }
                 });
             }
-
             return {
                 ...row,
                 student_group: mergeAndCleanGroups(expandedGroups)
@@ -865,28 +1002,22 @@ app.get('/api/teacher-classes', async (req, res) => {
 
         const makeupRes = await pool.query(`
             SELECT s.*,
-                   (SELECT teacher_title FROM main_classes WHERE teacher_name = s.teacher_name LIMIT 1) AS title -- 🌟 1. ดึงคำนำหน้าให้คาบชดเชยด้วย
+                   (SELECT teacher_title FROM main_classes WHERE teacher_name = s.teacher_name LIMIT 1) AS title 
             FROM schedules s
             WHERE REPLACE(s.teacher_name, ' ', '') ILIKE $1 
-            AND s.status = 'อนุมัติแล้ว' 
+            AND s.status = 'อนุมัติแล้ว'
+            AND ($2 = '' OR s.academic_year = $2)
+            AND ($3 = '' OR s.semester = $3)
             AND (s.class_date > CURRENT_DATE OR (s.class_date = CURRENT_DATE AND s.end_time >= CURRENT_TIME))
-        `, [`%${cleanName}%`]);
+        `, [`%${cleanName}%`, academic_year || '', semester || '']);
 
-        const daysThai = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
-        
-        // 🌟 บังคับดึงเวลาไทย และแปลเป็นวันภาษาไทยตรงๆ (จะได้ "วันเสาร์")
         const makeupClasses = makeupRes.rows.map(m => {
-            const thaiDay = new Date(m.class_date).toLocaleDateString('th-TH', {
-                weekday: 'long',
-                timeZone: 'Asia/Bangkok'
-            });
-            const correctDay = thaiDay.replace('วัน', ''); // ตัดคำว่า "วัน" ออกให้เหลือแค่ "เสาร์"
-
+            const thaiDay = new Date(m.class_date).toLocaleDateString('th-TH', { weekday: 'long', timeZone: 'Asia/Bangkok' });
             return {
                 ...m,
-                day_of_week: correctDay, // 🌟 1. ได้วันเสาร์ชัวร์ 1,000,000%
+                day_of_week: thaiDay.replace('วัน', ''), 
                 subject_code: `${m.subject_code} (ชดเชย)`,
-                isMakeup: true // 🌟 2. ธงเปลี่ยนสี
+                isMakeup: true 
             };
         });
 
@@ -897,10 +1028,59 @@ app.get('/api/teacher-classes', async (req, res) => {
     }
 });
 
+app.get('/api/academic-settings', async (req, res) => {
+    try {
+        const result = await pool.query("SELECT setting_value FROM system_settings WHERE setting_key = 'academic_periods'");
+        const value = result.rows[0]?.setting_value;
+        res.json({ success: true, data: value ? JSON.parse(value) : { current: null, periods: [] } });
+    } catch (error) {
+        console.error('Academic Settings Error:', error);
+        res.status(500).json({ success: false, message: 'ไม่สามารถโหลดการตั้งค่าภาคการศึกษาได้' });
+    }
+});
+
+app.put('/api/academic-settings', async (req, res) => {
+    const { current, periods } = req.body;
+    if (!current?.academic_year || !current?.semester || !Array.isArray(periods)) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลปีการศึกษาและภาคเรียนไม่ครบถ้วน' });
+    }
+    try {
+        const payload = JSON.stringify({ current, periods });
+        await pool.query(`
+            INSERT INTO system_settings (setting_key, setting_value)
+            VALUES ('academic_periods', $1)
+            ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value
+        `, [payload]);
+        res.json({ success: true, data: { current, periods }, message: 'บันทึกการตั้งค่าภาคการศึกษาสำเร็จ' });
+    } catch (error) {
+        console.error('Save Academic Settings Error:', error);
+        res.status(500).json({ success: false, message: 'ไม่สามารถบันทึกการตั้งค่าภาคการศึกษาได้' });
+    }
+});
+
+app.post('/api/schedules/:id/document', documentUpload.single('document'), async (req, res) => {
+    const { id } = req.params;
+    if (!req.file) return res.status(400).json({ success: false, message: 'กรุณาเลือกไฟล์ PDF หรือรูปภาพ' });
+
+    try {
+        const extension = path.extname(req.file.originalname).toLowerCase() || (req.file.mimetype === 'application/pdf' ? '.pdf' : '.jpg');
+        const fileName = `${req.file.filename}${extension}`;
+        const sourcePath = path.join(req.file.destination, req.file.filename);
+        const targetPath = path.join(req.file.destination, fileName);
+        fs.renameSync(sourcePath, targetPath);
+        const documentPath = `/uploads/documents/${fileName}`;
+        await pool.query('UPDATE schedules SET document_path = $1, document_name = $2 WHERE id = $3', [documentPath, req.file.originalname, id]);
+        res.json({ success: true, data: { document_path: documentPath, document_name: req.file.originalname }, message: 'อัปโหลดเอกสารสำเร็จ' });
+    } catch (error) {
+        if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+        console.error('Document Upload Error:', error);
+        res.status(500).json({ success: false, message: 'ไม่สามารถบันทึกเอกสารได้' });
+    }
+});
 
 app.get('/api/admin/users', async (req, res) => {
     try {
-        const query = 'SELECT id, username, name, role, is_blocked FROM users ORDER BY id ASC';
+        const query = 'SELECT id, username, name, role, is_blocked, title, curriculum FROM users ORDER BY id ASC';
         const result = await pool.query(query);
         res.json({ success: true, data: result.rows });
     } catch (error) {
@@ -970,49 +1150,30 @@ app.post('/api/admin/users', async (req, res) => {
 
 app.get('/api/executive/stats', async (req, res) => {
     try {
-
-        // 1. สรุปจำนวนตามสถานะ
         const statusQuery = `
             SELECT status, COUNT(*)::int AS count
             FROM schedules
             GROUP BY status
         `;
 
-        // 2. Leaderboard อาจารย์ที่ขอมากสุด พร้อม approved/rejected
         const leaderboardQuery = `
-    SELECT
-        teacher_name,
-        COUNT(*)::int AS count,
-        COUNT(*)::int AS approved,
-        0::int        AS rejected
-    FROM schedules
-    WHERE status = 'อนุมัติแล้ว'
-    GROUP BY teacher_name
-    ORDER BY count DESC
-    LIMIT 5
-`;
+            SELECT teacher_name, COUNT(*)::int AS count, COUNT(*)::int AS approved, 0::int AS rejected
+            FROM schedules
+            WHERE status = 'อนุมัติแล้ว'
+            GROUP BY teacher_name
+            ORDER BY count DESC
+            LIMIT 5
+        `;
 
-        // 3. เทรนด์รายเดือน พร้อม approved แยก
         const trendQuery = `
-            SELECT
-                TO_CHAR(class_date, 'Mon')                                           AS month,
-                COUNT(*)::int                                                        AS count,
-                COUNT(*) FILTER (WHERE status = 'อนุมัติแล้ว')::int                 AS approved,
-                MIN(class_date)                                                      AS sort_date
+            SELECT TO_CHAR(class_date, 'Mon') AS month, COUNT(*)::int AS count, COUNT(*) FILTER (WHERE status = 'อนุมัติแล้ว')::int AS approved, MIN(class_date) AS sort_date
             FROM schedules
             GROUP BY TO_CHAR(class_date, 'Mon')
             ORDER BY MIN(class_date)
         `;
 
-        // 4. วิชาที่ขอชดเชยบ่อยสุด — JOIN main_classes เพื่อเอาชื่อวิชา
         const subjectQuery = `
-            SELECT
-                s.subject_code,
-                SPLIT_PART(
-                    (SELECT mc.subject_name FROM main_classes mc 
-                    WHERE mc.subject_code = s.subject_code LIMIT 1),
-                ' - ', 1) AS subject_name,
-                COUNT(*)::int AS count
+            SELECT s.subject_code, SPLIT_PART((SELECT mc.subject_name FROM main_classes mc WHERE mc.subject_code = s.subject_code LIMIT 1), ' - ', 1) AS subject_name, COUNT(*)::int AS count
             FROM schedules s
             WHERE s.status = 'อนุมัติแล้ว'
             GROUP BY s.subject_code
@@ -1020,56 +1181,29 @@ app.get('/api/executive/stats', async (req, res) => {
             LIMIT 10
         `;
 
-
-        // 5. สรุปเหตุผลที่ไม่อนุมัติ
         const rejectionQuery = `
-            SELECT
-                COALESCE(NULLIF(TRIM(reason), ''), '(ไม่ระบุ)') AS reason,
-                COUNT(*)::int AS count
+            SELECT COALESCE(NULLIF(TRIM(reason), ''), '(ไม่ระบุ)') AS reason, COUNT(*)::int AS count
             FROM schedules
             WHERE status = 'ไม่อนุมัติ'
             GROUP BY reason
             ORDER BY count DESC
         `;
 
-        // 6. สถิติรายอาจารย์ครบถ้วน (ใช้ใน tab รายอาจารย์)
-       const teacherStatsQuery = `
-    SELECT
-        teacher_name,
-        COUNT(*)::int AS total,      
-        COUNT(*)::int AS approved,   
-        0::int        AS rejected
-    FROM schedules
-    WHERE status = 'อนุมัติแล้ว'
-    GROUP BY teacher_name
-    ORDER BY total DESC
-`;
+        const teacherStatsQuery = `
+            SELECT teacher_name, COUNT(*)::int AS total, COUNT(*)::int AS approved, 0::int AS rejected
+            FROM schedules
+            WHERE status = 'อนุมัติแล้ว'
+            GROUP BY teacher_name
+            ORDER BY total DESC
+        `;
 
-        // รัน query ทั้งหมดพร้อมกัน
-        const [
-            statusRes,
-            leaderboardRes,
-            trendRes,
-            subjectRes,
-            rejectionRes,
-            teacherStatsRes,
-        ] = await Promise.all([
-            pool.query(statusQuery),
-            pool.query(leaderboardQuery),
-            pool.query(trendQuery),
-            pool.query(subjectQuery),
-            pool.query(rejectionQuery),
-            pool.query(teacherStatsQuery),
+        const [statusRes, leaderboardRes, trendRes, subjectRes, rejectionRes, teacherStatsRes] = await Promise.all([
+            pool.query(statusQuery), pool.query(leaderboardQuery), pool.query(trendQuery), pool.query(subjectQuery), pool.query(rejectionQuery), pool.query(teacherStatsQuery),
         ]);
 
         res.json({
-            success:          true,
-            statusCounts:     statusRes.rows,
-            leaderboard:      leaderboardRes.rows,
-            monthlyTrend:     trendRes.rows,
-            subjectRanking:   subjectRes.rows,
-            rejectionReasons: rejectionRes.rows,
-            teacherStats:     teacherStatsRes.rows,
+            success: true, statusCounts: statusRes.rows, leaderboard: leaderboardRes.rows, monthlyTrend: trendRes.rows,
+            subjectRanking: subjectRes.rows, rejectionReasons: rejectionRes.rows, teacherStats: teacherStatsRes.rows,
         });
 
     } catch (error) {
@@ -1096,21 +1230,19 @@ app.put('/api/executive/approve/:id', async (req, res) => {
     }
 });
 
-// ==========================================
-// API: ค้นหาตารางเรียนนักศึกษา 
-// ==========================================
 app.get('/api/student-classes', async (req, res) => {
-    const { group } = req.query;
+    const { group, academic_year, semester } = req.query;
     try {
         const regRes = await pool.query(`
             SELECT m.*, ARRAY_AGG(csg.student_group) as groups
             FROM main_classes m
             LEFT JOIN class_student_groups csg ON m.id = csg.class_id
             WHERE m.id IN (SELECT class_id FROM class_student_groups WHERE student_group ILIKE $1)
+            AND ($2 = '' OR m.academic_year = $2)
+            AND ($3 = '' OR m.semester = $3)
             GROUP BY m.id
-        `, [`%${group}%`]);
+        `, [`%${group}%`, academic_year || '', semester || '']);
         
-        // 🌟 แปลงร่างเป็น student_group กลับคืนมา
         const regularClasses = regRes.rows.map(row => ({
             ...row,
             student_group: mergeAndCleanGroups(row.groups)
@@ -1118,35 +1250,23 @@ app.get('/api/student-classes', async (req, res) => {
 
         const makeupRes = await pool.query(`
             SELECT * FROM schedules 
-            WHERE student_group LIKE $1 
+            WHERE student_group LIKE $1
+            AND ($2 = '' OR academic_year = $2)
+            AND ($3 = '' OR semester = $3)
             AND status = 'อนุมัติแล้ว' 
             AND (class_date > CURRENT_DATE OR (class_date = CURRENT_DATE AND end_time >= CURRENT_TIME))
-        `, [`%${group}%`]);
+        `, [`%${group}%`, academic_year || '', semester || '']);
 
-        const daysThai = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
-        // ==========================================
-        // 🌟 ท่อนจัดการข้อมูลชดเชย สำหรับ API ของนักศึกษา
-        // ==========================================
         const makeupClasses = makeupRes.rows.map(m => {
-            // บังคับดึงเวลาไทย และแปลเป็นวันภาษาไทยตรงๆ
-            const thaiDay = new Date(m.class_date).toLocaleDateString('th-TH', {
-                weekday: 'long',
-                timeZone: 'Asia/Bangkok'
-            });
-            const correctDay = thaiDay.replace('วัน', ''); // ตัดคำว่า "วัน" ออกให้เหลือแค่ จันทร์-อาทิตย์
-
+            const thaiDay = new Date(m.class_date).toLocaleDateString('th-TH', { weekday: 'long', timeZone: 'Asia/Bangkok' });
             return {
                 ...m,
-                day_of_week: correctDay, // 🌟 1. ได้วันเสาร์ชัวร์ 1,000,000%
+                day_of_week: thaiDay.replace('วัน', ''), 
                 subject_code: `${m.subject_code} (ชดเชย)`,
-                isMakeup: true // 🌟 2. ธงเปลี่ยนสีเป็นเหลือง/ส้ม
+                isMakeup: true 
             };
         });
         
-        // (อย่าลืมเอา makeupClasses ไปรวมกับ regularClasses ด้วยคำสั่งคล้ายๆ แบบนี้นะครับ)
-        // const allClasses = [...regularClasses, ...makeupClasses];
-        // res.json({ success: true, data: allClasses });
-
         res.json({ success: true, data: [...regularClasses, ...makeupClasses] });
     } catch (error) {
         console.error(error);
@@ -1154,17 +1274,10 @@ app.get('/api/student-classes', async (req, res) => {
     }
 });
 
-// ==========================================
-// API สำหรับดึงกลุ่มเรียนของวิชานั้นๆ (อัปเกรดแก้ปัญหาตัวเลือกซ้ำซ้อน + แสดงชื่อเต็ม)
-// ==========================================
 app.get('/api/groups-by-subject', async (req, res) => {
     const { code, teacherName } = req.query;
     try {
-        // ตัดช่องว่างออกจากชื่ออาจารย์
         const cleanName = teacherName ? teacherName.replace(/\s+/g, '') : '';
-
-        // 🌟 1. แก้ไข SQL ให้จัดกลุ่มเป็น Array (groups) ตามคาบเรียน (m.id)
-        // 🌟 2. ใช้ ILIKE คู่กับ REPLACE เพื่อหาชื่ออาจารย์แบบไม่สนช่องว่าง
         const query = `
             SELECT 
                 m.id, 
@@ -1178,14 +1291,10 @@ app.get('/api/groups-by-subject', async (req, res) => {
         `;
                 
         const result = await pool.query(query, [code, `%${cleanName}%`]);
-        
         const uniqueOptions = new Set();
         
         result.rows.forEach(row => {
-            // ตอนนี้ row.groups จะมีข้อมูลส่งมาจาก ARRAY_AGG แล้วครับ
             if (row.groups && row.groups.length > 0) {
-                
-                // 🌟 [จุดที่เติมเข้าไป]: แตกข้อความที่มีเครื่องหมาย | ออกเป็นชิ้นๆ ก่อน
                 let expandedGroups = [];
                 row.groups.forEach(g => {
                     if (g) {
@@ -1193,7 +1302,6 @@ app.get('/api/groups-by-subject', async (req, res) => {
                     }
                 });
 
-                // กรองชื่อกลุ่มให้สมบูรณ์ (เปลี่ยนจาก row.groups มาใช้ expandedGroups แทน)
                 let validGroups = expandedGroups.filter(Boolean);
                 validGroups.sort((a, b) => b.length - a.length);
                 
@@ -1204,7 +1312,6 @@ app.get('/api/groups-by-subject', async (req, res) => {
                     if (!isDuplicate) keptGroups.push(g);
                 });
                 
-                // 🌟 จุดที่แก้ไข: สร้างแค่ 1 ตัวเลือก ต่อ 1 คาบเรียนเท่านั้น! 
                 if (keptGroups.length > 0) {
                     uniqueOptions.add(keptGroups.sort().join(' | '));
                 }
@@ -1218,9 +1325,6 @@ app.get('/api/groups-by-subject', async (req, res) => {
     }
 });
 
-// ==========================================
-// API: อัปโหลดไฟล์ Excel แปลชื่อกลุ่มเรียน (Master Data)
-// ==========================================
 app.post('/api/upload-groups-master', upload.single('file'), async (req, res) => {
     try {
         if (!req.file) {
@@ -1229,21 +1333,17 @@ app.post('/api/upload-groups-master', upload.single('file'), async (req, res) =>
 
         const workbook = xlsx.readFile(req.file.path);
         const sheet = workbook.Sheets[workbook.SheetNames[0]];
-        // อ่านข้อมูลแบบแถวต่อแถว
         const data = xlsx.utils.sheet_to_json(sheet, { header: 1 }); 
 
         let insertedCount = 0;
 
-        // วนลูปอ่านข้อมูล (สมมติว่า คอลัมน์ A = รหัสสั้น, คอลัมน์ B = ชื่อเต็ม)
         for (let i = 0; i < data.length; i++) {
             const row = data[i];
             if (row.length >= 2) {
                 const shortName = row[0]?.toString().trim();
                 const fullName = row[1]?.toString().trim();
 
-                // ข้ามบรรทัดที่เป็นหัวตาราง หรือบรรทัดว่าง
                 if (shortName && fullName && shortName !== 'รหัสสั้น') {
-                    // ใช้คำสั่ง UPSERT: ถ้ามีรหัสนี้แล้วให้อัปเดตชื่อ ถ้ายังไม่มีให้เพิ่มใหม่
                     const query = `
                         INSERT INTO student_groups_master (short_name, full_name)
                         VALUES ($1, $2)
@@ -1262,16 +1362,10 @@ app.post('/api/upload-groups-master', upload.single('file'), async (req, res) =>
     }
 });
 
-// ==========================================
-// API: ยกเลิก/ลบคำขอสอนชดเชย
-// ==========================================
 app.delete('/api/schedules/:id', async (req, res) => {
     const { id } = req.params;
     try {
-        const result = await pool.query(
-            'DELETE FROM schedules WHERE id = $1 RETURNING id',
-            [id]
-        );
+        const result = await pool.query('DELETE FROM schedules WHERE id = $1 RETURNING id', [id]);
         if (result.rows.length === 0) {
             return res.status(404).json({ success: false, message: 'ไม่พบรายการที่ต้องการลบ' });
         }
@@ -1282,13 +1376,10 @@ app.delete('/api/schedules/:id', async (req, res) => {
     }
 });
 
-// ==========================================
-// API: ดึงรายชื่ออาจารย์และสาขา (เวอร์ชันกรองชื่อซ้ำและดึงสาขาจริงมาถม)
-// ==========================================
 app.get('/api/teachers-list', async (req, res) => {
+    const { academic_year, semester } = req.query; 
     try {
-        // 🌟 1. ดึงข้อมูลดิบออกมาก่อน
-        const query = `
+        let query = `
             SELECT 
                 TRIM(teacher_name) AS teacher_name, 
                 curriculum, 
@@ -1296,42 +1387,37 @@ app.get('/api/teachers-list', async (req, res) => {
             FROM main_classes 
             WHERE teacher_name IS NOT NULL AND TRIM(teacher_name) NOT IN ('', 'ไม่ระบุ')
         `;
-        const result = await pool.query(query);
+        let values = [];
 
-        // 🌟 2. ใช้ JavaScript จัดกลุ่มและรวมร่างข้อมูล (แก้ปัญหาเคาะ Spacebar ไม่เท่ากัน)
+        if (academic_year && semester) {
+            query += ` AND academic_year = $1 AND semester = $2`;
+            values.push(academic_year, semester);
+        }
+
+        const result = await pool.query(query, values);
         const teacherMap = {};
 
         result.rows.forEach(row => {
             if (!row.teacher_name) return;
-            
-            // ลบช่องว่างทั้งหมดออก เพื่อใช้เป็น Key เทียบว่าใช่คนเดียวกันไหม
             const cleanKey = row.teacher_name.replace(/\s+/g, '');
 
             if (!teacherMap[cleanKey]) {
                 teacherMap[cleanKey] = {
-                    name: row.teacher_name.replace(/\s+/g, ' '), // จัดช่องว่างให้เหลือแค่ 1 เคาะสวยๆ
+                    name: row.teacher_name.replace(/\s+/g, ' '),
                     curriculum: row.curriculum,
                     title: row.title || 'อาจารย์'
                 };
             } else {
-                // 🌟 ถ้าระบบเจอชื่ออาจารย์คนเดิมซ้ำ ให้ดึง "สาขาจริง" มาถมใส่ในช่องที่เคยเป็นค่าว่าง (null) จากตาราง นศ.
                 if (!teacherMap[cleanKey].curriculum && row.curriculum) {
                     teacherMap[cleanKey].curriculum = row.curriculum;
                 }
-                // ถ้าเจอตำแหน่งที่ละเอียดกว่าคำว่า "อาจารย์" ให้อัปเดตตำแหน่งด้วย
                 if (teacherMap[cleanKey].title === 'อาจารย์' && row.title && row.title !== 'อาจารย์') {
                     teacherMap[cleanKey].title = row.title;
                 }
             }
         });
 
-        // 🌟 3. แปลงกลับเป็น Array และส่งให้หน้าเว็บ
-        const finalTeachers = Object.values(teacherMap).map(t => ({
-            teacher_name: t.name,
-            curriculum: t.curriculum,
-            title: t.title
-        }));
-
+        const finalTeachers = Object.values(teacherMap).map(t => ({ teacher_name: t.name, curriculum: t.curriculum, title: t.title }));
         res.json({ success: true, data: finalTeachers });
     } catch (error) {
         console.error('Fetch Teachers Error:', error);
@@ -1339,19 +1425,20 @@ app.get('/api/teachers-list', async (req, res) => {
     }
 });
 
-// ==========================================
-// API: ดึงข้อมูลสถิติภาพรวม (สำหรับ Dashboard)
-// ==========================================
 app.get('/api/dashboard-stats', async (req, res) => {
     try {
-        // นับจำนวนทั้งหมด
-        const totalRes = await pool.query('SELECT COUNT(*) FROM schedules');
-        
-        // นับจำนวนที่อนุมัติแล้ว
-        const approvedRes = await pool.query("SELECT COUNT(*) FROM schedules WHERE status = 'อนุมัติแล้ว'");
-        
-        // นับจำนวนที่รอตรวจสอบ (รวมทุกสถานะที่ยังไม่เสร็จสิ้น)
-        const pendingRes = await pool.query("SELECT COUNT(*) FROM schedules WHERE status IN ('รอตรวจสอบ', 'รออนุมัติ', 'รอผู้บริหารพิจารณา')");
+        const { academic_year, semester } = req.query;
+        let filterStr = '';
+        let params = [];
+
+        if (academic_year && semester) {
+            filterStr = ' AND academic_year = $1 AND semester = $2';
+            params = [academic_year, semester];
+        }
+
+        const totalRes = await pool.query(`SELECT COUNT(*) FROM schedules WHERE 1=1 ${filterStr}`, params);
+        const approvedRes = await pool.query(`SELECT COUNT(*) FROM schedules WHERE status = 'อนุมัติแล้ว' ${filterStr}`, params);
+        const pendingRes = await pool.query(`SELECT COUNT(*) FROM schedules WHERE status IN ('รอตรวจสอบ', 'รออนุมัติ', 'รอผู้บริหารพิจารณา') ${filterStr}`, params);
 
         res.json({
             success: true,
@@ -1367,22 +1454,27 @@ app.get('/api/dashboard-stats', async (req, res) => {
     }
 });
 
-// ==========================================
-// API: ดึงข้อมูลกราฟสถิติ (แยกตามวันที่สร้างคำขอ 7 วันย้อนหลัง)
-// ==========================================
 app.get('/api/chart-data', async (req, res) => {
     try {
-        // จัดกลุ่มตามวันที่ และนับจำนวนคำขอ (ใช้ของ PostgreSQL)
+        const { academic_year, semester } = req.query;
+        let filterStr = '';
+        let params = [];
+
+        if (academic_year && semester) {
+            filterStr = 'WHERE academic_year = $1 AND semester = $2';
+            params = [academic_year, semester];
+        }
+
         const query = `
             SELECT TO_CHAR(created_at, 'DD/MM/YYYY') as date, COUNT(*) as requests
             FROM schedules
+            ${filterStr}
             GROUP BY DATE(created_at), TO_CHAR(created_at, 'DD/MM/YYYY')
             ORDER BY DATE(created_at) DESC
             LIMIT 7
         `;
-        const result = await pool.query(query);
+        const result = await pool.query(query, params);
 
-        // กลับด้าน Array ให้อดีตอยู่ซ้าย ปัจจุบันอยู่ขวา เพื่อให้กราฟอ่านง่ายขึ้น
         const chartData = result.rows.reverse().map(row => ({
             date: row.date,
             requests: parseInt(row.requests)
@@ -1398,4 +1490,165 @@ app.get('/api/chart-data', async (req, res) => {
 const PORT = 3001;
 app.listen(PORT, () => {
     console.log(`🚀 เซิร์ฟเวอร์กำลังทำงานอยู่ที่พอร์ต ${PORT}`);
+});
+
+app.get('/api/admin/report-summary', async (req, res) => {
+    try {
+        const rejectedRes = await pool.query("SELECT COUNT(*) FROM schedules WHERE status = 'ไม่อนุมัติ'");
+        const branchRes = await pool.query(`
+            SELECT COALESCE(NULLIF(mc.curriculum, ''), 'ไม่ระบุหลักสูตร') AS branch,
+                   COUNT(s.id)::int AS total,
+                   COUNT(*) FILTER (WHERE s.status = 'อนุมัติแล้ว')::int AS approved,
+                   COUNT(*) FILTER (WHERE s.status IN ('รอตรวจสอบ', 'รออนุมัติ', 'รอผู้บริหารพิจารณา'))::int AS pending
+            FROM schedules s
+            LEFT JOIN main_classes mc ON mc.subject_code = s.subject_code
+            GROUP BY COALESCE(NULLIF(mc.curriculum, ''), 'ไม่ระบุหลักสูตร')
+            ORDER BY total DESC, branch ASC
+            LIMIT 8
+        `);
+        const recentRes = await pool.query(`
+            SELECT s.id, s.subject_code, s.teacher_name, s.status, s.created_at,
+                   COALESCE(NULLIF(mc.curriculum, ''), 'ไม่ระบุหลักสูตร') AS branch
+            FROM schedules s
+            LEFT JOIN main_classes mc ON mc.subject_code = s.subject_code
+            ORDER BY s.created_at DESC NULLS LAST, s.id DESC
+            LIMIT 6
+        `);
+        const total = await pool.query('SELECT COUNT(*)::int AS count FROM schedules');
+        const totalCount = total.rows[0].count;
+        const approved = await pool.query("SELECT COUNT(*)::int AS count FROM schedules WHERE status = 'อนุมัติแล้ว'");
+
+        res.json({
+            success: true,
+            data: {
+                rejected: parseInt(rejectedRes.rows[0].count, 10),
+                approvalRate: totalCount ? Math.round((approved.rows[0].count / totalCount) * 100) : 0,
+                byBranch: branchRes.rows,
+                recent: recentRes.rows,
+            }
+        });
+    } catch (error) {
+        console.error('Admin Report Summary Error:', error);
+        res.status(500).json({ success: false, message: 'ไม่สามารถดึงข้อมูลรายงานแอดมินได้' });
+    }
+});
+
+app.delete('/api/academic-uploads/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const result = await pool.query('SELECT relative_path FROM academic_uploads WHERE id = $1', [id]);
+        if (result.rows.length > 0) {
+            const filePath = path.join(__dirname, result.rows[0].relative_path);
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath); // ลบไฟล์จริงๆ ออกจากโฟลเดอร์
+            await pool.query('DELETE FROM academic_uploads WHERE id = $1', [id]); // ลบข้อมูลใน DB
+        }
+        res.json({ success: true, message: 'ลบประวัติการอัปโหลดสำเร็จ' });
+    } catch (error) {
+        console.error('Delete Upload Error:', error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการลบข้อมูล' });
+    }
+});
+
+// ==========================================
+// 🌟 API: ดึงรายชื่ออาจารย์ที่ถูกล็อคตารางสอนแล้ว (เอาไว้โชว์ประวัติ)
+// ==========================================
+app.get('/api/verified-schedules', async (req, res) => {
+    const { academic_year, semester } = req.query;
+    if (!academic_year || !semester) return res.json({ success: false, data: [] });
+
+    try {
+        const query = `
+            SELECT DISTINCT teacher_name, curriculum, verified_pdf_path 
+            FROM main_classes 
+            WHERE is_locked = true 
+            AND academic_year = $1 AND semester = $2
+            ORDER BY curriculum, teacher_name
+        `;
+        const result = await pool.query(query, [academic_year, semester]);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error('Fetch Verified Error:', error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูล' });
+    }
+});
+
+// ==========================================
+// 🌟 API: ดึงประวัติการอัปโหลด Excel
+// ==========================================
+app.get('/api/academic-uploads', async (req, res) => {
+    const { academic_year, semester } = req.query;
+    try {
+        const result = await pool.query(`
+            SELECT id, academic_year, semester, branch, curriculum, schedule_type, year_level, original_name, relative_path, uploaded_at
+            FROM academic_uploads
+            WHERE ($1 = '' OR academic_year = $1) AND ($2 = '' OR semester = $2)
+            ORDER BY uploaded_at DESC
+        `, [academic_year || '', semester || '']);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error('Academic Upload List Error:', error);
+        res.status(500).json({ success: false, message: 'ไม่สามารถโหลดรายการไฟล์ Excel ได้' });
+    }
+});
+
+// ==========================================
+// 🌟 API: ดึงรายชื่ออาจารย์ที่ยืนยันตารางสอนแล้ว (เอาไว้โชว์ประวัติ PDF)
+// ==========================================
+app.get('/api/verified-schedules', async (req, res) => {
+    const { academic_year, semester } = req.query;
+    if (!academic_year || !semester) return res.json({ success: false, data: [] });
+
+    try {
+        const query = `
+            SELECT DISTINCT teacher_name, curriculum, verified_pdf_path 
+            FROM main_classes 
+            WHERE is_locked = true 
+            AND academic_year = $1 AND semester = $2
+            ORDER BY curriculum, teacher_name
+        `;
+        const result = await pool.query(query, [academic_year, semester]);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error('Fetch Verified Error:', error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูล' });
+    }
+});
+
+// ==========================================
+// 🌟 API: ยกเลิกการล็อคตาราง (เพื่อเปลี่ยนไฟล์ PDF)
+// ==========================================
+app.delete('/api/verified-schedules', async (req, res) => {
+    const { teacher_name, academic_year, semester } = req.query;
+    
+    if (!teacher_name || !academic_year || !semester) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
+    }
+
+    try {
+        const cleanName = teacher_name.replace(/\s+/g, '');
+        
+        // 1. ค้นหา Path ของไฟล์เดิมเพื่อตามไปลบทิ้งออกจากเซิร์ฟเวอร์
+        const fileQuery = `SELECT verified_pdf_path FROM main_classes WHERE REPLACE(teacher_name, ' ', '') ILIKE $1 AND academic_year = $2 AND semester = $3 LIMIT 1`;
+        const fileRes = await pool.query(fileQuery, [`%${cleanName}%`, academic_year, semester]);
+        
+        if (fileRes.rows.length > 0 && fileRes.rows[0].verified_pdf_path) {
+            // ปรับแก้ Path ให้ถูกต้อง และลบไฟล์ทิ้ง
+            const relativePath = fileRes.rows[0].verified_pdf_path.startsWith('/') ? fileRes.rows[0].verified_pdf_path.substring(1) : fileRes.rows[0].verified_pdf_path;
+            const absolutePath = path.join(__dirname, relativePath);
+            if (fs.existsSync(absolutePath)) fs.unlinkSync(absolutePath);
+        }
+
+        // 2. ปลดล็อค (Unlock) ตารางสอนใน Database ให้กลับมาแก้ไขได้ชั่วคราว
+        const updateQuery = `
+            UPDATE main_classes 
+            SET is_locked = false, verified_pdf_path = NULL 
+            WHERE REPLACE(teacher_name, ' ', '') ILIKE $1 AND academic_year = $2 AND semester = $3
+        `;
+        await pool.query(updateQuery, [`%${cleanName}%`, academic_year, semester]);
+
+        res.json({ success: true, message: 'สามารถอัปโหลดไฟล์ใหม่ได้เลย' });
+    } catch (error) {
+        console.error('Unlock Error:', error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+    }
 });
