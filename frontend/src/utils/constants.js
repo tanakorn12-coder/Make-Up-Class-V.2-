@@ -1,4 +1,9 @@
-export const API = import.meta.env.VITE_API_URL;
+export const API = `${import.meta.env.VITE_API_URL}/api`;
+
+//เก็บไว้ให้ฉัน 3 อันล่างนี้ไม่เอาออก 
+// export const API = 'http://localhost:3001/api'
+// https://api.render.com/deploy/srv-dar0ssm0tbcc738ji590?key=OPjMrounJIQ
+// export const API = import.meta.env.VITE_API_URL;
 
 export const STATUS_MAP = {
   'รอตรวจสอบ':          { bg: '#FFF8E1', text: '#795548', dot: '#F9A825' },
