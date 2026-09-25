@@ -346,8 +346,8 @@ export default function App() {
         }
 
         .nav-brand { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
-        .logo-box { background: #ffffff; padding: 6px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
-        .logo-box img { width: 38px; height: 38px; object-fit: contain; }
+        .logo-box { display: flex; align-items: center; justify-content: center; }
+        .logo-box img { width: 44px; height: 44px; object-fit: contain; }
         .brand-text { display: flex; flex-direction: column; }
         .brand-title { font-weight: 800; font-size: 15px; color: #1B5E20; letter-spacing: -0.2px; }
         .brand-subtitle { font-size: 11px; color: #64748B; font-weight: 600; }
